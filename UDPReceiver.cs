@@ -22,6 +22,16 @@ public class UDPReceiver : MonoBehaviour
     // 나중에 UI에서 연결 상태를 표시할 때 사용할 수 있습니다.
     public static bool isConnected = false;
 
+    // DemoStatusUI.cs에서 읽는 현재 상태값
+    public static string currentTrackingState = "WAITING";
+    public static string currentPointerSource = "UNKNOWN";
+    public static int currentPacketSize = 0;
+    public static int currentCalibrated = 0;
+    public static int currentButton = 0;
+    public static float currentPointerX = 0f;
+    public static float currentPointerY = 0f;
+    public static int currentPressureRaw = 0;
+
     [Serializable]
     private class BridgePayload
     {
@@ -51,7 +61,11 @@ public class UDPReceiver : MonoBehaviour
         public float finger_qw;
 
         public int button;
+        public int pressure_raw;
         public int packet_size;
+        public string pointer_source;
+        public string tracking_state;
+        public string writing_input_mode;
     }
 
     [Header("UDP 설정")]
@@ -152,6 +166,14 @@ public class UDPReceiver : MonoBehaviour
     {
         isDrawing = false;
         isConnected = false;
+        currentTrackingState = "WAITING";
+        currentPointerSource = "UNKNOWN";
+        currentPacketSize = 0;
+        currentCalibrated = 0;
+        currentButton = 0;
+        currentPointerX = 0f;
+        currentPointerY = 0f;
+        currentPressureRaw = 0;
         calibrated = false;
         hasData = false;
         pointerCenter = Vector2.zero;
@@ -205,10 +227,29 @@ public class UDPReceiver : MonoBehaviour
         isConnected = hasData &&
                       (DateTime.UtcNow - lastReceiveUtc).TotalSeconds < connectionTimeoutSeconds;
 
+        if (!isConnected)
+        {
+            currentTrackingState = hasData ? "CONNECTION LOST" : "WAITING";
+        }
+
         if (data == null)
         {
             return;
         }
+
+        // UI에서 표시할 최신 상태값을 메인 스레드에서 갱신합니다.
+        currentTrackingState = string.IsNullOrEmpty(data.tracking_state)
+            ? (data.calibrated == 1 ? "TRACKING" : "CALIBRATING")
+            : data.tracking_state;
+        currentPointerSource = string.IsNullOrEmpty(data.pointer_source)
+            ? "UNKNOWN"
+            : data.pointer_source;
+        currentPacketSize = data.packet_size;
+        currentCalibrated = data.calibrated;
+        currentButton = data.button;
+        currentPointerX = data.pointer_x;
+        currentPointerY = data.pointer_y;
+        currentPressureRaw = data.pressure_raw;
 
         // Python 자이로 초기 보정이 끝나기 전에는 손 위치를 움직이지 않습니다.
         if (data.calibrated == 0)
