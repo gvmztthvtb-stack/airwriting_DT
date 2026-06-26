@@ -103,7 +103,7 @@ unity_bridge_from_main_ws_v2.py
 
 ```text
 main.py
-unity_bridge_team_review_v1_1.py
+unity_bridge_final_v1.py
 ```
 
 두 프로그램 모두 같은 ESP32 COM 포트를 직접 열기 때문에 Windows에서 다음 오류가 발생할 수 있습니다.
@@ -118,7 +118,7 @@ COM port connection failed
 
 | 실행 목적 | 실행할 Python |
 |---|---|
-| Unity 단독 시연 | `unity_bridge_team_review_v1_1.py` |
+| Unity 단독 시연 | `unity_bridge_final_v1.py` |
 | S2 센서 테스트 | `unity_bridge_s2_hand_test_v1.py` |
 | 웹·AI·Unity 통합 | `main.py` + `unity_bridge_from_main_ws_v2.py` |
 
