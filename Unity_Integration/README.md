@@ -88,7 +88,7 @@ WEB_SENSITIVITY_Y = 0.30
 ## 통합 실패 시 백업 모드
 
 ```text
-Unity 단독: unity_bridge_team_review_v1_1.py + Unity
+Unity 단독 (S3): unity_bridge_final_v1.py + Unity
 S2 비상: unity_bridge_s2_hand_test_v1.py + Unity
 ```
 
