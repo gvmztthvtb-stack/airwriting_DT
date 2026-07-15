@@ -1,510 +1,611 @@
-"""
-Air Writing 통합 시연용 Unity Relay
-===================================
-
-버전: tp-main-ws-unity-relay-v3
-
-역할
-----
-팀 공통 main.py는 수정하지 않습니다.
-main.py가 WebSocket으로 보내는 ray_hit, is_writing, orientations,
-streaming_text/prediction을 받아 Unity UDP JSON으로 변환합니다.
-
-중요
-----
-- 이 파일은 ESP32 COM 포트를 열지 않습니다.
-- 따라서 main.py와 동시에 실행할 수 있습니다.
-- 통합 시연 중에는 기존 단독 Bridge와 Serial Monitor를 종료하세요.
-- Relay는 Yaw 드리프트를 새로 보정하지 않습니다.
-- main.py의 ray_hit이 밀리면 웹과 Unity가 같은 방향으로 밀립니다.
-- Unity는 여전히 pointer_x / pointer_y(-1~+1)를 사용합니다.
-
-실행
-----
-1) py main.py
-2) 웹 디지털 트윈 정상 동작 확인
-3) py unity_bridge_from_main_ws_v3.py
-4) Unity 실행
-
-단축키
-------
-R : 현재 ray_hit을 Unity 중앙 기준으로 재설정
-Q : Relay 종료
-
-문제 발생 시 대처
------------------
-1) [연결 성공]이 안 뜸
-   - main.py 실행 여부 확인
-   - MAIN_WS_URL과 WebSocket 포트 확인
-
-2) 웹은 움직이는데 Unity가 안 움직임
-   - Relay pointer 로그가 변하는지 확인
-   - Unity UDP Port=12346
-   - Apply Pointer Position 체크
-   - Use Additional Unity Pointer Center 해제
-
-3) 손 모델이 너무 빨리 끝에 붙음
-   - WEB_SENSITIVITY_X/Y를 낮춤: 0.30 → 0.25 → 0.22
-   - 장갑을 정면에 두고 Relay에서 R
-
-4) 움직임이 너무 작음
-   - WEB_SENSITIVITY_X/Y를 높임: 0.30 → 0.35
-
-5) 좌우/상하가 반대
-   - Unity Pointer Axis Sign에서 해당 축만 -1
-   - Relay와 Unity 양쪽에서 동시에 부호를 바꾸지 않음
-
-6) Trail이 안 그려짐
-   - Relay 로그 writing=1 확인
-   - writing=0이면 main.py is_writing 확인
-   - writing=1이면 Unity Trail/PenTip 연결 확인
-
-7) AI 결과가 WAITING에서 안 바뀜
-   - Relay [AI 인식] 로그 확인
-   - AI 통합 UDPReceiver/DemoStatusUI 적용 확인
-
-8) 통합 모드가 실패함
-   - main.py와 Relay 종료
-   - unity_bridge_team_review_v1_1.py + Unity 단독 시연
-   - 또는 unity_bridge_s2_hand_test_v1.py + Unity 비상 시연
-"""
-
-from __future__ import annotations
-
-import asyncio
-import json
-import math
-import socket
-import time
-from typing import Any, Optional
-
-try:
-    import websockets
-except ImportError:
-    print("[오류] websockets 패키지가 필요합니다.")
-    print("설치: py -m pip install websockets")
-    raise SystemExit(1)
-
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
-
-
-# ============================================================================
-# 설정
-# ============================================================================
-
-MAIN_WS_URL = "ws://127.0.0.1:12347"
-
-UNITY_IP = "127.0.0.1"
-UNITY_PORT = 12346
-
-# 웹 프론트의 main.js와 동일한 감도:
-# const SENSITIVITY = 0.30
-WEB_SENSITIVITY_X = 0.30
-WEB_SENSITIVITY_Y = 0.30
-
-# 웹 프론트와 동일하게 X축을 반전합니다.
-OUTPUT_SIGN_X = -1.0
-OUTPUT_SIGN_Y = 1.0
-
-# Unity로 보내기 전에 최종 -1~+1 제한
-POINTER_LIMIT = 1.0
-
-# 현재 장갑이 92B Legacy이면 92, 94B 최신 펌웨어이면 94로 변경
-DISPLAY_PACKET_SIZE = 92
-
-RECONNECT_DELAY_SEC = 2.0
-LOG_INTERVAL_SEC = 1.0
-
-
-# ============================================================================
-# 유틸리티
-# ============================================================================
-
-def clamp(value: float, minimum: float, maximum: float) -> float:
-    return max(minimum, min(maximum, value))
-
-
-def safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def quaternion_wxyz_to_xyzw(values: Any) -> tuple[float, float, float, float]:
-    """
-    main.py orientations는 [w, x, y, z].
-    Unity JSON은 qx, qy, qz, qw로 전달합니다.
-    """
-    if not isinstance(values, (list, tuple)) or len(values) < 4:
-        return 0.0, 0.0, 0.0, 1.0
-
-    w = safe_float(values[0], 1.0)
-    x = safe_float(values[1])
-    y = safe_float(values[2])
-    z = safe_float(values[3])
-    return x, y, z, w
-
-
-def check_key() -> Optional[str]:
-    if msvcrt is None or not msvcrt.kbhit():
-        return None
-    try:
-        return msvcrt.getwch().lower()
-    except Exception:
-        return None
-
-
-# ============================================================================
-# Relay
-# ============================================================================
-
-class UnityRelay:
-    def __init__(self) -> None:
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        self.center_x: Optional[float] = None
-        self.center_y: Optional[float] = None
-        self.pending_recenter = False
-        self.frame_count = 0
-
-        self.pointer_x = 0.0
-        self.pointer_y = 0.0
-        self.is_writing = 0
-        self.last_ts = 0
-
-        self.hand_accel = (0.0, 0.0, 0.0)
-        self.hand_q = (0.0, 0.0, 0.0, 1.0)
-        self.finger_q = (0.0, 0.0, 0.0, 1.0)
-
-        self.recognized_sentence = ""
-        self.latest_char = ""
-        self.confidence = -1.0
-
-        self.last_log_time = 0.0
-        self.raw_ray_x = 0.0
-        self.raw_ray_y = 0.0
-        self.saturation_start_x: Optional[float] = None
-        self.saturation_start_y: Optional[float] = None
-        self.saturation_warned_x = False
-        self.saturation_warned_y = False
-        self.running = True
-
-    def close(self) -> None:
-        self.udp.close()
-
-    def request_recenter(self) -> None:
-        self.pending_recenter = True
-        print("[요청] 다음 ray_hit을 Unity 중앙 기준으로 저장합니다.")
-
-    def update_center(self, ray_x: float, ray_y: float) -> None:
-        self.center_x = ray_x
-        self.center_y = ray_y
-        self.pending_recenter = False
-        print(
-            "[Unity 중앙 설정]",
-            f"ray_hit=({self.center_x:+.3f}, {self.center_y:+.3f})",
-        )
-
-    def handle_frame(self, data: dict[str, Any]) -> None:
-        ray_hit = data.get("ray_hit")
-        if not isinstance(ray_hit, (list, tuple)) or len(ray_hit) < 2:
-            return
-
-        ray_x = safe_float(ray_hit[0])
-        ray_y = safe_float(ray_hit[1])
-        self.raw_ray_x = ray_x
-        self.raw_ray_y = ray_y
-
-        self.frame_count += 1
-
-        # 시작 시 한 번, 또는 사용자가 R을 눌렀을 때만 중앙을 갱신합니다.
-        # 실행 중 자동으로 중심이 다시 바뀌지 않도록 합니다.
-        if (
-            self.center_x is None
-            or self.center_y is None
-            or self.pending_recenter
-        ):
-            self.update_center(ray_x, ray_y)
-
-        relative_x = ray_x - float(self.center_x)
-        relative_y = ray_y - float(self.center_y)
-
-        self.pointer_x = clamp(
-            OUTPUT_SIGN_X * relative_x * WEB_SENSITIVITY_X,
-            -POINTER_LIMIT,
-            POINTER_LIMIT,
-        )
-        self.pointer_y = clamp(
-            OUTPUT_SIGN_Y * relative_y * WEB_SENSITIVITY_Y,
-            -POINTER_LIMIT,
-            POINTER_LIMIT,
-        )
-
-        self._check_saturation()
-
-        self.is_writing = 1 if bool(data.get("is_writing", False)) else 0
-        self.last_ts = safe_int(data.get("ts"), int(time.time() * 1000))
-
-        raw_sensors = data.get("raw_sensors", {})
-        if isinstance(raw_sensors, dict):
-            s2 = raw_sensors.get("s2", {})
-            if isinstance(s2, dict):
-                self.hand_accel = (
-                    safe_float(s2.get("ax")),
-                    safe_float(s2.get("ay")),
-                    safe_float(s2.get("az")),
-                )
-
-        orientations = data.get("orientations", {})
-        if isinstance(orientations, dict):
-            self.hand_q = quaternion_wxyz_to_xyzw(
-                orientations.get("hand")
-            )
-            self.finger_q = quaternion_wxyz_to_xyzw(
-                orientations.get("finger")
-            )
-
-        self.send_unity()
-
-    def _check_saturation(self) -> None:
-        """포인터가 범위 끝에 오래 붙어 있으면 해결 방법을 출력합니다."""
-        now = time.time()
-        self.saturation_start_x, self.saturation_warned_x = self._check_axis(
-            "X", self.pointer_x, self.saturation_start_x,
-            self.saturation_warned_x, now
-        )
-        self.saturation_start_y, self.saturation_warned_y = self._check_axis(
-            "Y", self.pointer_y, self.saturation_start_y,
-            self.saturation_warned_y, now
-        )
-
-    @staticmethod
-    def _check_axis(
-        axis: str,
-        value: float,
-        started: Optional[float],
-        warned: bool,
-        now: float,
-    ) -> tuple[Optional[float], bool]:
-        if abs(value) < 0.95:
-            return None, False
-        if started is None:
-            return now, False
-        if not warned and now - started >= 1.0:
-            print(
-                f"[범위 경고] {axis} pointer={value:+.2f} | "
-                "R로 중앙을 다시 잡거나 감도를 낮추세요."
-            )
-            return started, True
-        return started, warned
-
-    def handle_ai_message(self, data: dict[str, Any]) -> None:
-        message_type = str(data.get("type", ""))
-
-        if message_type == "streaming_text":
-            sentence = str(data.get("sentence", ""))
-            latest_char = str(data.get("latest_char", ""))
-
-            self.recognized_sentence = sentence
-
-            if latest_char == "<ERASE>":
-                self.latest_char = sentence[-1:] if sentence else ""
-            elif latest_char.strip():
-                self.latest_char = latest_char
-
-            # 현재 main.py streaming_text에는 confidence가 없습니다.
-            self.confidence = safe_float(data.get("confidence"), -1.0)
-            self.send_unity()
-            print(
-                "[AI 인식]",
-                f"latest='{self.latest_char}'",
-                f"sentence='{self.recognized_sentence}'",
-            )
-
-        elif message_type == "prediction":
-            label = str(data.get("label", ""))
-            if label:
-                self.latest_char = label
-                self.recognized_sentence = label
-                self.confidence = safe_float(data.get("confidence"), -1.0)
-                self.send_unity()
-                print("[AI Prediction]", label)
-
-    def send_unity(self) -> None:
-        hand_qx, hand_qy, hand_qz, hand_qw = self.hand_q
-        finger_qx, finger_qy, finger_qz, finger_qw = self.finger_q
-
-        payload = {
-            "type": "glove",
-            "ts": int(self.last_ts),
-            "calibrated": 1,
-
-            "pointer_x": float(self.pointer_x),
-            "pointer_y": float(self.pointer_y),
-            "pointer_angle_x_deg": 0.0,
-            "pointer_angle_y_deg": 0.0,
-
-            "button": int(self.is_writing),
-            "pressure_raw": int(self.is_writing),
-            "writing_input_mode": "MAIN_WS",
-
-            "packet_size": int(DISPLAY_PACKET_SIZE),
-            "pointer_source": "MAIN_WS_RAY_HIT",
-            "tracking_state": "TRACKING",
-            "transport": "WS_TO_UDP_RELAY",
-
-            "hand_ax": float(self.hand_accel[0]),
-            "hand_ay": float(self.hand_accel[1]),
-            "hand_az": float(self.hand_accel[2]),
-
-            "hand_qx": float(hand_qx),
-            "hand_qy": float(hand_qy),
-            "hand_qz": float(hand_qz),
-            "hand_qw": float(hand_qw),
-
-            "finger_qx": float(finger_qx),
-            "finger_qy": float(finger_qy),
-            "finger_qz": float(finger_qz),
-            "finger_qw": float(finger_qw),
-
-            "recognized_text": self.recognized_sentence,
-            "recognized_char": self.latest_char,
-            "recognition_confidence": float(self.confidence),
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using UnityEngine;
+
+/// <summary>
+/// Python unity_bridge.py가 보내는 UDP JSON을 받아
+/// 1) 버튼으로 Trail On/Off 상태를 전달하고
+/// 2) 손등 가속도 기반으로 손 모델 회전을 안정화하며
+/// 3) 손가락 방향 기반 pointer_x / pointer_y로 손 모델 위치를 이동합니다.
+///
+/// 이 스크립트는 손 모델의 localPosition을 사용하므로,
+/// Right Hand Model이 Main Camera 또는 빈 부모 오브젝트의 자식이어도 동작합니다.
+/// </summary>
+public class UDPReceiver : MonoBehaviour
+{
+    // AirWritingTrailDrawer.cs가 이 값을 읽어서 Trail을 켜고 끕니다.
+    public static bool isDrawing = false;
+
+    // 나중에 UI에서 연결 상태를 표시할 때 사용할 수 있습니다.
+    public static bool isConnected = false;
+
+    // DemoStatusUI.cs에서 읽는 현재 상태값
+    public static string currentTrackingState = "WAITING";
+    public static string currentPointerSource = "UNKNOWN";
+    public static int currentPacketSize = 0;
+    public static int currentCalibrated = 0;
+    public static int currentButton = 0;
+    public static float currentPointerX = 0f;
+    public static float currentPointerY = 0f;
+    public static int currentPressureRaw = 0;
+
+    // AI 인식 결과
+    public static string currentRecognizedText = "";
+    public static string currentRecognizedChar = "";
+    public static float currentRecognitionConfidence = -1f;
+    public static string currentTransport = "DIRECT_SERIAL";
+
+    [Serializable]
+    private class BridgePayload
+    {
+        public string type;
+        public int ts;
+        public int calibrated;
+
+        // Python에서 -1 ~ +1 범위로 보내는 방향 기반 포인터 좌표
+        public float pointer_x;
+        public float pointer_y;
+        public float pointer_angle_x_deg;
+        public float pointer_angle_y_deg;
+
+        // 손 회전 안정화용 raw acceleration
+        public float hand_ax;
+        public float hand_ay;
+        public float hand_az;
+
+        // 참고용 quaternion
+        public float hand_qx;
+        public float hand_qy;
+        public float hand_qz;
+        public float hand_qw;
+        public float finger_qx;
+        public float finger_qy;
+        public float finger_qz;
+        public float finger_qw;
+
+        public int button;
+        public int pressure_raw;
+        public int packet_size;
+        public string pointer_source;
+        public string tracking_state;
+        public string writing_input_mode;
+        public string transport;
+
+        // main.py WebSocket Relay가 추가로 보내는 AI 결과
+        public string recognized_text;
+        public string recognized_char;
+        public float recognition_confidence;
+    }
+
+    [Header("UDP 설정")]
+    public int port = 12346;
+
+    [Header("필수 연결")]
+    [Tooltip("Unity Hierarchy의 Right Hand Model을 연결합니다.")]
+    public Transform hand;
+
+    [Header("기준점 재설정")]
+    [Tooltip("첫 데이터 수신 시 손 모델의 회전 기준과 초기 Transform을 설정합니다.")]
+    public bool autoCalibrateOnStart = true;
+
+    [Tooltip("Python에서 이미 상대 포인터를 계산하므로 기본 OFF를 권장합니다. ON이면 Unity가 현재 pointer_x/y를 다시 중앙으로 빼므로 실행할 때마다 가용 범위가 달라질 수 있습니다.")]
+    public bool useAdditionalUnityPointerCenter = false;
+
+    [Tooltip("실행 중 현재 장갑 위치/자세를 중앙으로 다시 설정하는 키입니다.")]
+    public KeyCode recenterKey = KeyCode.R;
+
+    [Header("손 회전 - Raw Acceleration 안정 모드")]
+    public bool applyHandRotation = true;
+
+    [Tooltip("높을수록 손 모델 회전이 빠르게 따라옵니다.")]
+    public float rotationSmooth = 8f;
+
+    [Tooltip("가속도 방향 자체의 떨림을 줄이는 값입니다.")]
+    public float accelDirectionSmooth = 8f;
+
+    [Tooltip("작은 회전은 무시합니다. 단위는 degree입니다.")]
+    public float rotationDeadZone = 2f;
+
+    [Tooltip("손 모델의 최대 기울기입니다.")]
+    public float maxTiltDegree = 35f;
+
+    [Tooltip("손 모델 기본 방향이 맞지 않을 때 사용하는 고정 보정값입니다.")]
+    public Vector3 rotationOffsetEuler = Vector3.zero;
+
+    [Tooltip("회전 방향이 반대인 축은 1을 -1로 바꿉니다.")]
+    public Vector3 rotationAxisSign = new Vector3(1f, 1f, 1f);
+
+    [Tooltip("앞뒤 기울기")]
+    public bool usePitchX = true;
+
+    [Tooltip("Yaw는 가속도만으로 안정적으로 알 수 없으므로 기본 OFF입니다.")]
+    public bool useYawY = false;
+
+    [Tooltip("좌우 기울기")]
+    public bool useRollZ = true;
+
+    [Header("손 위치 - 방향 기반 2D 포인터")]
+    public bool applyPointerPosition = true;
+
+    [Tooltip("좌우/상하 이동 반응 크기입니다. 1부터 시작하세요.")]
+    public Vector2 pointerSensitivity = new Vector2(1f, 1f);
+
+    [Tooltip("좌우 또는 상하가 반대로 움직이면 해당 값을 -1로 바꿉니다.")]
+    public Vector2 pointerAxisSign = new Vector2(1f, 1f);
+
+    [Tooltip("작은 포인터 변화는 무시합니다.")]
+    public float pointerDeadZone = 0.015f;
+
+    [Tooltip("손이 기준 위치에서 움직일 수 있는 최대 범위입니다. Z는 0으로 두면 깊이는 고정됩니다.")]
+    public Vector3 maxHandMoveLocal = new Vector3(0.18f, 0.12f, 0f);
+
+    [Tooltip("높을수록 손 위치가 빠르게 따라옵니다.")]
+    public float positionSmooth = 10f;
+
+    [Tooltip("기준 위치에 추가로 더할 오프셋입니다.")]
+    public Vector3 handPositionOffset = Vector3.zero;
+
+    [Header("디버그")]
+    public bool debugLog = true;
+    public float connectionTimeoutSeconds = 1.0f;
+
+    private UdpClient client;
+    private Thread receiveThread;
+    private volatile bool running;
+
+    private readonly object dataLock = new object();
+    private BridgePayload latestData;
+    private bool hasData;
+    private DateTime lastReceiveUtc;
+
+    private bool calibrated;
+
+    // Unity 씬에서 Play를 누르기 전 배치한 손 모델의 기준 Transform
+    private Vector3 baseHandLocalPosition;
+    private Quaternion baseHandLocalRotation;
+
+    // R 키 또는 자동 보정 시 저장하는 장갑 기준값
+    private Vector2 pointerCenter;
+    private Vector3 initialGravity = Vector3.up;
+    private Vector3 filteredGravity = Vector3.up;
+
+    private float lastDebugTime;
+
+    private void Start()
+    {
+        isDrawing = false;
+        isConnected = false;
+        currentTrackingState = "WAITING";
+        currentPointerSource = "UNKNOWN";
+        currentPacketSize = 0;
+        currentCalibrated = 0;
+        currentButton = 0;
+        currentPointerX = 0f;
+        currentPointerY = 0f;
+        currentPressureRaw = 0;
+        currentRecognizedText = "";
+        currentRecognizedChar = "";
+        currentRecognitionConfidence = -1f;
+        currentTransport = "DIRECT_SERIAL";
+        calibrated = false;
+        hasData = false;
+        pointerCenter = Vector2.zero;
+
+        if (hand == null)
+        {
+            Debug.LogError("UDPReceiver: Hand가 비어 있습니다. Right Hand Model을 연결하세요.");
+            enabled = false;
+            return;
         }
 
-        self.udp.sendto(
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8"),
-            (UNITY_IP, UNITY_PORT),
-        )
+        // 씬에서 미리 배치한 1인칭 손 위치와 회전을 고정 기준으로 저장합니다.
+        baseHandLocalPosition = hand.localPosition;
+        baseHandLocalRotation = hand.localRotation;
 
-        now = time.time()
-        if now - self.last_log_time >= LOG_INTERVAL_SEC:
-            center_x = self.center_x if self.center_x is not None else 0.0
-            center_y = self.center_y if self.center_y is not None else 0.0
-            print(
-                "[Unity Relay]",
-                f"ray=({self.raw_ray_x:+.3f},{self.raw_ray_y:+.3f})",
-                f"center=({center_x:+.3f},{center_y:+.3f})",
-                f"pointer=({self.pointer_x:+.2f},{self.pointer_y:+.2f})",
-                f"writing={self.is_writing}",
-                f"result='{self.latest_char or '-'}'",
-            )
-            self.last_log_time = now
+        StartReceiver();
+    }
 
+    private void StartReceiver()
+    {
+        try
+        {
+            client = new UdpClient(port);
+            running = true;
 
-async def keyboard_loop(relay: UnityRelay) -> None:
-    while relay.running:
-        key = check_key()
+            receiveThread = new Thread(ReceiveLoop);
+            receiveThread.IsBackground = true;
+            receiveThread.Start();
 
-        if key == "r":
-            relay.request_recenter()
-        elif key == "q":
-            print("[종료] Q 입력")
-            relay.running = False
-            return
+            Debug.Log("UDPReceiver 시작 / Port: " + port);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("UDPReceiver 시작 실패: " + e.Message);
+        }
+    }
 
-        await asyncio.sleep(0.03)
+    private void Update()
+    {
+        BridgePayload data = null;
 
+        lock (dataLock)
+        {
+            if (hasData)
+            {
+                data = latestData;
+            }
+        }
 
-async def websocket_loop(relay: UnityRelay) -> None:
-    while relay.running:
-        try:
-            print(f"[연결 시도] {MAIN_WS_URL}")
+        // 최근 패킷 수신 시간을 기준으로 연결 상태 계산
+        isConnected = hasData &&
+                      (DateTime.UtcNow - lastReceiveUtc).TotalSeconds < connectionTimeoutSeconds;
 
-            async with websockets.connect(
-                MAIN_WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=2,
-                max_size=2**20,
-            ) as websocket:
-                print("[연결 성공] main.py WebSocket")
-                relay.frame_count = 0
-                relay.center_x = None
-                relay.center_y = None
+        if (!isConnected)
+        {
+            currentTrackingState = hasData ? "CONNECTION LOST" : "WAITING";
+        }
 
-                while relay.running:
-                    try:
-                        raw_message = await asyncio.wait_for(
-                            websocket.recv(),
-                            timeout=1.0,
-                        )
-                    except asyncio.TimeoutError:
-                        # 연결은 유지하면서 키 입력과 종료 상태를 계속 확인합니다.
-                        continue
+        if (data == null)
+        {
+            return;
+        }
 
-                    try:
-                        data = json.loads(raw_message)
-                    except json.JSONDecodeError:
-                        continue
+        // UI에서 표시할 최신 상태값을 메인 스레드에서 갱신합니다.
+        currentTrackingState = string.IsNullOrEmpty(data.tracking_state)
+            ? (data.calibrated == 1 ? "TRACKING" : "CALIBRATING")
+            : data.tracking_state;
+        currentPointerSource = string.IsNullOrEmpty(data.pointer_source)
+            ? "UNKNOWN"
+            : data.pointer_source;
+        currentPacketSize = data.packet_size;
+        currentCalibrated = data.calibrated;
+        currentButton = data.button;
+        currentPointerX = data.pointer_x;
+        currentPointerY = data.pointer_y;
+        currentPressureRaw = data.pressure_raw;
 
-                    if not isinstance(data, dict):
-                        continue
+        if (!string.IsNullOrEmpty(data.recognized_text))
+        {
+            currentRecognizedText = data.recognized_text;
+        }
 
-                    if "ray_hit" in data:
-                        relay.handle_frame(data)
-                    elif data.get("type") in {
-                        "streaming_text",
-                        "prediction",
-                    }:
-                        relay.handle_ai_message(data)
-        except (
-            OSError,
-            ConnectionError,
-            websockets.ConnectionClosed,
-        ) as error:
-            if relay.running:
-                relay.is_writing = 0
-                relay.send_unity()
-                print(f"[WebSocket 끊김] {error}")
-                print(f"{RECONNECT_DELAY_SEC:.0f}초 후 재연결합니다...")
-                await asyncio.sleep(RECONNECT_DELAY_SEC)
-        except Exception as error:
-            if relay.running:
-                relay.is_writing = 0
-                relay.send_unity()
-                print(f"[Relay 오류] {type(error).__name__}: {error}")
-                await asyncio.sleep(RECONNECT_DELAY_SEC)
+        if (!string.IsNullOrEmpty(data.recognized_char))
+        {
+            currentRecognizedChar = data.recognized_char;
+        }
 
+        currentRecognitionConfidence = data.recognition_confidence;
 
-async def async_main() -> None:
-    relay = UnityRelay()
+        if (!string.IsNullOrEmpty(data.transport))
+        {
+            currentTransport = data.transport;
+        }
 
-    print("=" * 68)
-    print("Air Writing main.py → Unity 통합 Relay")
-    print(f"WebSocket: {MAIN_WS_URL}")
-    print(f"Unity UDP: {UNITY_IP}:{UNITY_PORT}")
-    print("R=Unity 중앙 재설정 / Q=종료")
-    print("=" * 68)
+        // Python 자이로 초기 보정이 끝나기 전에는 손 위치를 움직이지 않습니다.
+        if (data.calibrated == 0)
+        {
+            isDrawing = data.button == 1;
+            return;
+        }
 
-    try:
-        await asyncio.gather(
-            websocket_loop(relay),
-            keyboard_loop(relay),
-        )
-    finally:
-        relay.running = False
-        relay.close()
+        isDrawing = data.button == 1;
 
+        if (!calibrated && autoCalibrateOnStart)
+        {
+            Calibrate(data);
+        }
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(async_main())
-    except KeyboardInterrupt:
-        print("\n[종료] 사용자 중단")
+        // Game 창에 포커스가 있는 상태에서 R을 누르면 중앙 재설정
+        if (Input.GetKeyDown(recenterKey))
+        {
+            Calibrate(data);
+        }
+
+        if (!calibrated)
+        {
+            return;
+        }
+
+        ApplyStableRotation(data);
+        ApplyPointerPosition(data);
+
+        if (debugLog && Time.time - lastDebugTime >= 1f)
+        {
+            Debug.Log(
+                "UDP 연결=" + isConnected +
+                " / button=" + data.button +
+                " / pointer=(" + data.pointer_x.ToString("F2") + ", " +
+                                   data.pointer_y.ToString("F2") + ")" +
+                " / packet=" + data.packet_size
+            );
+
+            lastDebugTime = Time.time;
+        }
+    }
+
+    /// <summary>
+    /// 현재 장갑 자세를 Unity 손 모델의 회전 기준으로 저장합니다.
+    /// pointer_x/y는 Python에서 이미 시작 자세 대비 상대 좌표로 계산되므로,
+    /// useAdditionalUnityPointerCenter가 OFF이면 Unity에서는 추가 중앙 보정을 하지 않습니다.
+    /// </summary>
+    private void Calibrate(BridgePayload data)
+    {
+        pointerCenter = useAdditionalUnityPointerCenter
+            ? new Vector2(data.pointer_x, data.pointer_y)
+            : Vector2.zero;
+
+        initialGravity = GetSafeAccelerationDirection(
+            data.hand_ax,
+            data.hand_ay,
+            data.hand_az
+        );
+        filteredGravity = initialGravity;
+
+        // R을 누르면 손 모델을 씬에서 설정한 중앙 위치로 되돌립니다.
+        hand.localPosition = baseHandLocalPosition + handPositionOffset;
+        hand.localRotation = baseHandLocalRotation * Quaternion.Euler(rotationOffsetEuler);
+
+        calibrated = true;
+        if (useAdditionalUnityPointerCenter)
+        {
+            Debug.Log("Unity 추가 포인터 중앙 보정 완료: 현재 pointer_x/y를 중심으로 저장했습니다.");
+        }
+        else
+        {
+            Debug.Log("Unity 초기화 완료: 포인터 기준은 Python 상대 좌표를 그대로 사용합니다.");
+        }
+    }
+
+    /// <summary>
+    /// 손등 가속도에서 중력 방향을 구해 기준 자세 대비 기울기만 적용합니다.
+    /// 자이로 yaw 적분을 직접 사용하지 않기 때문에 제자리 빙글빙글 회전이 줄어듭니다.
+    /// </summary>
+    private void ApplyStableRotation(BridgePayload data)
+    {
+        if (!applyHandRotation)
+        {
+            return;
+        }
+
+        Vector3 currentGravity = GetSafeAccelerationDirection(
+            data.hand_ax,
+            data.hand_ay,
+            data.hand_az
+        );
+
+        filteredGravity = Vector3.Slerp(
+            filteredGravity,
+            currentGravity,
+            Time.deltaTime * accelDirectionSmooth
+        );
+
+        Quaternion relativeRotation = Quaternion.FromToRotation(
+            initialGravity,
+            filteredGravity
+        );
+
+        Vector3 euler = NormalizeEuler(relativeRotation.eulerAngles);
+
+        euler.x = ApplyDeadZone(euler.x, rotationDeadZone);
+        euler.y = ApplyDeadZone(euler.y, rotationDeadZone);
+        euler.z = ApplyDeadZone(euler.z, rotationDeadZone);
+
+        if (!usePitchX)
+        {
+            euler.x = 0f;
+        }
+
+        if (!useYawY)
+        {
+            euler.y = 0f;
+        }
+
+        if (!useRollZ)
+        {
+            euler.z = 0f;
+        }
+
+        euler = new Vector3(
+            euler.x * rotationAxisSign.x,
+            euler.y * rotationAxisSign.y,
+            euler.z * rotationAxisSign.z
+        );
+
+        euler.x = Mathf.Clamp(euler.x, -maxTiltDegree, maxTiltDegree);
+        euler.y = Mathf.Clamp(euler.y, -maxTiltDegree, maxTiltDegree);
+        euler.z = Mathf.Clamp(euler.z, -maxTiltDegree, maxTiltDegree);
+
+        Quaternion targetRotation =
+            baseHandLocalRotation *
+            Quaternion.Euler(euler) *
+            Quaternion.Euler(rotationOffsetEuler);
+
+        hand.localRotation = Quaternion.Slerp(
+            hand.localRotation,
+            targetRotation,
+            Time.deltaTime * rotationSmooth
+        );
+    }
+
+    /// <summary>
+    /// Python의 pointer_x/y를 손 모델의 local X/Y 위치로 변환합니다.
+    /// pointer_x/y는 -1~+1 범위이며, maxHandMoveLocal 범위 밖으로는 나갈 수 없습니다.
+    /// Z는 baseHandLocalPosition.z에 고정되어 카메라 뒤로 날아가지 않습니다.
+    /// </summary>
+    private void ApplyPointerPosition(BridgePayload data)
+    {
+        if (!applyPointerPosition)
+        {
+            return;
+        }
+
+        // Python이 이미 시작 자세 대비 상대 좌표(-1~+1)를 만들기 때문에
+        // 기본값에서는 그 좌표를 그대로 사용합니다.
+        // Unity에서 다시 중심값을 빼면 Play를 누를 때의 드리프트 위치가 새 중심이 되어
+        // 좌우/상하 가용 범위가 실행마다 달라질 수 있습니다.
+        float relativeX = useAdditionalUnityPointerCenter
+            ? data.pointer_x - pointerCenter.x
+            : data.pointer_x;
+        float relativeY = useAdditionalUnityPointerCenter
+            ? data.pointer_y - pointerCenter.y
+            : data.pointer_y;
+
+        relativeX = ApplyDeadZone(relativeX, pointerDeadZone);
+        relativeY = ApplyDeadZone(relativeY, pointerDeadZone);
+
+        relativeX *= pointerSensitivity.x * pointerAxisSign.x;
+        relativeY *= pointerSensitivity.y * pointerAxisSign.y;
+
+        // 중앙값과 현재값 차이가 커도 -1~+1 안으로 제한
+        relativeX = Mathf.Clamp(relativeX, -1f, 1f);
+        relativeY = Mathf.Clamp(relativeY, -1f, 1f);
+
+        Vector3 localMove = new Vector3(
+            relativeX * maxHandMoveLocal.x,
+            relativeY * maxHandMoveLocal.y,
+            0f
+        );
+
+        Vector3 targetPosition =
+            baseHandLocalPosition +
+            handPositionOffset +
+            localMove;
+
+        // 축별 최종 범위 한 번 더 제한
+        targetPosition.x = Mathf.Clamp(
+            targetPosition.x,
+            baseHandLocalPosition.x + handPositionOffset.x - maxHandMoveLocal.x,
+            baseHandLocalPosition.x + handPositionOffset.x + maxHandMoveLocal.x
+        );
+
+        targetPosition.y = Mathf.Clamp(
+            targetPosition.y,
+            baseHandLocalPosition.y + handPositionOffset.y - maxHandMoveLocal.y,
+            baseHandLocalPosition.y + handPositionOffset.y + maxHandMoveLocal.y
+        );
+
+        // 깊이값은 항상 씬에 배치한 기준값으로 고정
+        targetPosition.z = baseHandLocalPosition.z + handPositionOffset.z;
+
+        hand.localPosition = Vector3.Lerp(
+            hand.localPosition,
+            targetPosition,
+            Time.deltaTime * positionSmooth
+        );
+    }
+
+    private Vector3 GetSafeAccelerationDirection(float x, float y, float z)
+    {
+        Vector3 acceleration = new Vector3(x, y, z);
+
+        if (acceleration.sqrMagnitude < 0.000001f)
+        {
+            return Vector3.up;
+        }
+
+        return acceleration.normalized;
+    }
+
+    private float ApplyDeadZone(float value, float deadZone)
+    {
+        return Mathf.Abs(value) < deadZone ? 0f : value;
+    }
+
+    private Vector3 NormalizeEuler(Vector3 euler)
+    {
+        euler.x = NormalizeAngle(euler.x);
+        euler.y = NormalizeAngle(euler.y);
+        euler.z = NormalizeAngle(euler.z);
+        return euler;
+    }
+
+    private float NormalizeAngle(float angle)
+    {
+        while (angle > 180f)
+        {
+            angle -= 360f;
+        }
+
+        while (angle < -180f)
+        {
+            angle += 360f;
+        }
+
+        return angle;
+    }
+
+    private void ReceiveLoop()
+    {
+        IPEndPoint anyIp = new IPEndPoint(IPAddress.Any, port);
+
+        while (running)
+        {
+            try
+            {
+                byte[] bytes = client.Receive(ref anyIp);
+                string json = Encoding.UTF8.GetString(bytes);
+                BridgePayload parsed = JsonUtility.FromJson<BridgePayload>(json);
+
+                lock (dataLock)
+                {
+                    latestData = parsed;
+                    hasData = true;
+                    lastReceiveUtc = DateTime.UtcNow;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (SocketException)
+            {
+                if (!running)
+                {
+                    break;
+                }
+            }
+            catch (Exception)
+            {
+                // Unity API 호출 없이 다음 패킷을 계속 기다립니다.
+            }
+        }
+    }
+
+    private void OnDestroy()
+    {
+        StopReceiver();
+    }
+
+    private void OnApplicationQuit()
+    {
+        StopReceiver();
+    }
+
+    private void StopReceiver()
+    {
+        if (!running)
+        {
+            return;
+        }
+
+        running = false;
+        isConnected = false;
+        isDrawing = false;
+
+        try
+        {
+            client?.Close();
+        }
+        catch (Exception)
+        {
+        }
+
+        if (receiveThread != null && receiveThread.IsAlive)
+        {
+            receiveThread.Join(200);
+        }
+    }
+}
