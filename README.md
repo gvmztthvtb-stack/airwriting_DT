@@ -24,7 +24,7 @@ Unity Digital Twin
 - Bridge: `bridge/unity_ai_bridge_purebilstm_bestperformance.py`
 - Model: `bridge/weights/pure_bilstm.pt`
 - Metadata: `bridge/weights/meta.pkl`
-- Firmware: `firmware/airwriting_esp32_v3/airwriting_esp32_v3.ino`
+- Firmware: `firmware/airwriting_esp32_v3/airwriting_esp32_v3.ino` (v3.4)
 - Unity Windows build: GitHub Releases에서 배포
 
 `pure_bilstm.pt`와 `meta.pkl`은 같은 학습 결과에서 생성된 한 쌍이므로 반드시 함께 사용해야 합니다.
@@ -37,7 +37,8 @@ Windows와 Python 3.12 64-bit를 권장합니다.
 
 ```powershell
 cd bridge
-py -m pip install -r requirements.txt
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ### 2. 장갑과 Bridge 실행
@@ -47,7 +48,7 @@ py -m pip install -r requirements.txt
 3. 다음 명령을 실행합니다.
 
 ```powershell
-py unity_ai_bridge_purebilstm_bestperformance.py
+.\.venv\Scripts\python.exe .\unity_ai_bridge_purebilstm_bestperformance.py
 ```
 
 초기 보정 안내가 나오면 실제 필기 자세로 장갑을 들고 4~6초간 움직이지 않습니다. 터미널에 `TRACKING`이 표시되면 다음 단계로 진행합니다.
@@ -104,8 +105,8 @@ Unity_Integration/              이전 Unity 통합 실험 자료
 
 ## 문서
 
-- [시연 실행 설명서](docs/DEMO_GUIDE_KO.txt)
-- [문제 해결 안내서](docs/TROUBLESHOOTING_KO.txt)
+- [설치 및 실행 안내서](docs/INSTALL_AND_RUN_KO.md)
+- [문제 해결 안내서](docs/TROUBLESHOOTING_KO.md)
 
 ## 공개 범위
 
