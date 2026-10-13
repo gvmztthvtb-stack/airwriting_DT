@@ -1,0 +1,33 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime output and local configuration
+*.log
+.env
+.env.*
+captures/
+logs/
+
+# Training data and generated evaluation artifacts
+datasets/
+data/
+*.npy
+*.npz
+checkpoints/
+
+# Unity generated directories and debug-only build output
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+*BurstDebugInformation_DoNotShip*/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
