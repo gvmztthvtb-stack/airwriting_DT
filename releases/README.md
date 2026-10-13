@@ -6,6 +6,8 @@ The release ZIP must contain the complete Unity build directory, including `AirW
 
 Prepared asset:
 
-- File: `AirWriting_Unity_Windows_final.zip`
-- Size: 36.85 MiB
-- SHA-256: `BA3955C184D58D4416AA83DE6D3947182AE46CCD2FA54DA737AE65CA151282D1`
+- File: `AirWriting_Unity_Hybrid_Demo_v1.0.1.zip`
+- Size: 36.86 MiB
+- SHA-256: `4D8DB2A4507F285D5FD15D38C8058DA40E18151FCFC6B0952A3A2F10D3ABE291`
+
+Version 1.0.1 uses the final presentation build with the F2 settings panel, F3 presenter view, and automatic Display 2 output. Version 1.0.0 used the earlier digital-twin build and did not include these presentation controls.
